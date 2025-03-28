@@ -1,80 +1,51 @@
 import socket
-import pygame
 import threading
 
-pygame.init()
+clients = []
+positions = {}
 
-# Настройки окна
-WIDTH, HEIGHT = 800, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Multiplayer Game")
-
-# Цвета
-WHITE = (255, 255, 255)
-RED = (255, 0, 0)
-BLUE = (0, 0, 255)
-
-# Сетевые настройки
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect(('localhost', 5555))
-
-player_pos = {"x": 50, "y": 50}
-other_players = {}
-
-
-def receive_updates():
+def handle_client(client_socket, addr):
+    print(f"[NEW CONNECTION] {addr} connected.")
+    player_id = len(clients) - 1
+    positions[player_id] = {"x": 50, "y": 50}
+    
     while True:
         try:
-            data = client.recv(1024).decode('utf-8')
-            if data.startswith("update:"):
-                _, player_id, x, y = data.split(":")
-                other_players[int(player_id)] = {"x": int(x), "y": int(y)}
-        except:
-            print("Disconnected from server")
-            client.close()
+            data = client_socket.recv(1024).decode('utf-8')
+            if not data:
+                break
+                
+            # Обработка движения: формат "move:x:y"
+            if data.startswith("move:"):
+                _, x, y = data.split(":")
+                positions[player_id]["x"] = int(x)
+                positions[player_id]["y"] = int(y)
+                
+                # Отправляем обновленные позиции всем клиентам
+                update_msg = f"update:{player_id}:{x}:{y}"
+                for client in clients:
+                    client.send(update_msg.encode('utf-8'))
+                    
+        except ConnectionResetError:
             break
+            
+    print(f"[DISCONNECTED] {addr} disconnected")
+    client_socket.close()
+    clients.remove(client_socket)
+    del positions[player_id]
 
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('0.0.0.0', 5555))
+    server.listen()
+    print("[SERVER] Server is listening on port 5555")
+    
+    while True:
+        client_socket, addr = server.accept()
+        clients.append(client_socket)
+        thread = threading.Thread(target=handle_client, args=(client_socket, addr))
+        thread.start()
+        print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
 
-# Запускаем поток для получения обновлений
-receive_thread = threading.Thread(target=receive_updates)
-receive_thread.daemon = True
-receive_thread.start()
-
-# Игровой цикл
-running = True
-clock = pygame.time.Clock()
-
-while running:
-    clock.tick(60)
-    screen.fill(WHITE)
-
-    # Обработка событий
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-
-    # Движение игрока
-    keys = pygame.key.get_pressed()
-    if keys[pygame.K_LEFT]:
-        player_pos["x"] -= 5
-    if keys[pygame.K_RIGHT]:
-        player_pos["x"] += 5
-    if keys[pygame.K_UP]:
-        player_pos["y"] -= 5
-    if keys[pygame.K_DOWN]:
-        player_pos["y"] += 5
-
-    # Отправляем позицию на сервер
-    client.send(f"move:{player_pos['x']}:{player_pos['y']}".encode('utf-8'))
-
-    # Рисуем игрока
-    pygame.draw.rect(screen, RED, (player_pos["x"], player_pos["y"], 50, 50))
-
-    # Рисуем других игроков
-    for player_id, pos in other_players.items():
-        pygame.draw.rect(screen, BLUE, (pos["x"], pos["y"], 50, 50))
-
-    pygame.display.flip()
-
-pygame.quit()
-client.close()
+if __name__ == "__main__":
+    start_server()
