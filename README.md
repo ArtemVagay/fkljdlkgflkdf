@@ -1,198 +1,142 @@
-import pygame
 import socket
-import json
 import threading
-
-# Initialize pygame
-pygame.init()
-WIDTH, HEIGHT = 800, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Multiplayer Game")
-clock = pygame.time.Clock()
-
-# Colors
-WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-RED = (255, 0, 0)
-GREEN = (0, 255, 0)
-BLUE = (0, 0, 255)
+import json
 
 
-class GameClient:
-    def __init__(self, host='localhost', port=5555):
-        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+class GameServer:
+    def __init__(self, host='0.0.0.0', port=5555):
         self.host = host
         self.port = port
-        self.player_id = None
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((host, port))
+        self.server.listen()
+        self.clients = []
+        self.players = {}
         self.game_state = {
             'players': {},
             'bullets': [],
             'scores': {}
         }
-        self.keys = {
-            'up': False,
-            'down': False,
-            'left': False,
-            'right': False
-        }
-        self.player_speed = 5
-        self.bullet_speed = 10
 
-    def connect(self):
-        try:
-            self.client.connect((self.host, self.port))
-            receive_thread = threading.Thread(target=self.receive)
-            receive_thread.daemon = True
-            receive_thread.start()
-            return True
-        except:
-            return False
+    def broadcast(self, data):
+        for client in self.clients:
+            try:
+                client.send(json.dumps(data).encode('utf-8'))
+            except:
+                self.clients.remove(client)
 
-    def send(self, data):
-        try:
-            self.client.send(json.dumps(data).encode('utf-8'))
-        except:
-            print("Connection lost")
+    def handle_client(self, client, addr):
+        print(f"[NEW CONNECTION] {addr} connected.")
 
-    def receive(self):
+        # Assign player ID
+        player_id = str(addr[1])
+        self.players[player_id] = {'x': 100, 'y': 100, 'color': (255, 0, 0)}
+        self.game_state['players'][player_id] = self.players[player_id]
+        self.game_state['scores'][player_id] = 0
+
+        # Send initial game state
+        client.send(json.dumps({
+            'type': 'init',
+            'player_id': player_id,
+            'game_state': self.game_state
+        }).encode('utf-8'))
+
         while True:
             try:
-                data = json.loads(self.client.recv(1024).decode('utf-8'))
+                data = json.loads(client.recv(1024).decode('utf-8'))
 
-                if data['type'] == 'init':
-                    self.player_id = data['player_id']
-                    self.game_state = data['game_state']
+                if data['type'] == 'move':
+                    self.players[player_id]['x'] = data['x']
+                    self.players[player_id]['y'] = data['y']
+                    self.game_state['players'] = self.players
+                    self.broadcast({
+                        'type': 'update',
+                        'game_state': self.game_state
+                    })
 
-                elif data['type'] == 'update':
-                    self.game_state = data['game_state']
+                elif data['type'] == 'shoot':
+                    bullet = {
+                        'x': data['x'],
+                        'y': data['y'],
+                        'dx': data['dx'],
+                        'dy': data['dy'],
+                        'owner': player_id
+                    }
+                    self.game_state['bullets'].append(bullet)
+                    self.broadcast({
+                        'type': 'update',
+                        'game_state': self.game_state
+                    })
+
+                elif data['type'] == 'hit':
+                    self.game_state['scores'][player_id] += 1
+                    self.broadcast({
+                        'type': 'update',
+                        'game_state': self.game_state
+                    })
 
             except:
-                print("Disconnected from server")
-                self.client.close()
+                print(f"[DISCONNECTED] {addr} disconnected.")
+                del self.players[player_id]
+                del self.game_state['players'][player_id]
+                del self.game_state['scores'][player_id]
+                self.clients.remove(client)
+                client.close()
+                self.broadcast({
+                    'type': 'update',
+                    'game_state': self.game_state
+                })
                 break
 
-    def move_player(self):
-        if self.player_id is None or self.player_id not in self.game_state['players']:
-            return
+    def update_game(self):
+        # Update bullets positions
+        for bullet in self.game_state['bullets'][:]:
+            bullet['x'] += bullet['dx']
+            bullet['y'] += bullet['dy']
 
-        player = self.game_state['players'][self.player_id]
-        dx, dy = 0, 0
+            # Remove bullets that are out of bounds
+            if (bullet['x'] < 0 or bullet['x'] > 800 or
+                    bullet['y'] < 0 or bullet['y'] > 600):
+                self.game_state['bullets'].remove(bullet)
 
-        if self.keys['up']:
-            dy -= self.player_speed
-        if self.keys['down']:
-            dy += self.player_speed
-        if self.keys['left']:
-            dx -= self.player_speed
-        if self.keys['right']:
-            dx += self.player_speed
+        # Check for collisions
+        for bullet in self.game_state['bullets'][:]:
+            for player_id, player in self.game_state['players'].items():
+                if player_id != bullet['owner']:
+                    if (abs(bullet['x'] - player['x']) < 20 and
+                            abs(bullet['y'] - player['y']) < 20):
+                        self.game_state['bullets'].remove(bullet)
+                        self.game_state['scores'][bullet['owner']] += 1
+                        break
 
-        new_x = player['x'] + dx
-        new_y = player['y'] + dy
+        self.broadcast({
+            'type': 'update',
+            'game_state': self.game_state
+        })
 
-        # Keep player within screen bounds
-        new_x = max(20, min(WIDTH - 20, new_x))
-        new_y = max(20, min(HEIGHT - 20, new_y))
+    def run(self):
+        print(f"[SERVER STARTED] on {self.host}:{self.port}")
 
-        if new_x != player['x'] or new_y != player['y']:
-            self.send({
-                'type': 'move',
-                'x': new_x,
-                'y': new_y
-            })
+        # Start game update thread
+        update_thread = threading.Thread(target=self._update_loop)
+        update_thread.daemon = True
+        update_thread.start()
 
-    def shoot(self, target_x, target_y):
-        if self.player_id is None or self.player_id not in self.game_state['players']:
-            return
+        # Accept connections
+        while True:
+            client, addr = self.server.accept()
+            self.clients.append(client)
+            thread = threading.Thread(target=self.handle_client, args=(client, addr))
+            thread.daemon = True
+            thread.start()
 
-        player = self.game_state['players'][self.player_id]
-        dx = target_x - player['x']
-        dy = target_y - player['y']
-
-        # Normalize direction
-        length = (dx ** 2 + dy ** 2) ** 0.5
-        if length > 0:
-            dx = dx / length * self.bullet_speed
-            dy = dy / length * self.bullet_speed
-
-            self.send({
-                'type': 'shoot',
-                'x': player['x'],
-                'y': player['y'],
-                'dx': dx,
-                'dy': dy
-            })
-
-
-def draw_game(screen, game_state, player_id):
-    screen.fill(BLACK)
-
-    # Draw players
-    for pid, player in game_state['players'].items():
-        color = player.get('color', RED) if pid != player_id else GREEN
-        pygame.draw.circle(screen, color, (int(player['x']), int(player['y'])), 20)
-
-    # Draw bullets
-    for bullet in game_state['bullets']:
-        pygame.draw.circle(screen, WHITE, (int(bullet['x']), int(bullet['y'])), 5)
-
-    # Draw scores
-    font = pygame.font.SysFont(None, 36)
-    y_pos = 10
-    for pid, score in game_state['scores'].items():
-        text = f"Player {pid}: {score}"
-        if pid == player_id:
-            text += " (YOU)"
-        text_surface = font.render(text, True, WHITE)
-        screen.blit(text_surface, (10, y_pos))
-        y_pos += 40
-
-    pygame.display.flip()
-
-
-def main():
-    client = GameClient()  # Change to server IP if needed
-    if not client.connect():
-        print("Failed to connect to server")
-        return
-
-    running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_w:
-                    client.keys['up'] = True
-                if event.key == pygame.K_s:
-                    client.keys['down'] = True
-                if event.key == pygame.K_a:
-                    client.keys['left'] = True
-                if event.key == pygame.K_d:
-                    client.keys['right'] = True
-
-            elif event.type == pygame.KEYUP:
-                if event.key == pygame.K_w:
-                    client.keys['up'] = False
-                if event.key == pygame.K_s:
-                    client.keys['down'] = False
-                if event.key == pygame.K_a:
-                    client.keys['left'] = False
-                if event.key == pygame.K_d:
-                    client.keys['right'] = False
-
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:  # Left mouse button
-                    mouse_x, mouse_y = pygame.mouse.get_pos()
-                    client.shoot(mouse_x, mouse_y)
-
-        client.move_player()
-        draw_game(screen, client.game_state, client.player_id)
-        clock.tick(60)
-
-    pygame.quit()
+    def _update_loop(self):
+        import time
+        while True:
+            self.update_game()
+            time.sleep(0.016)  # ~60 FPS
 
 
 if __name__ == "__main__":
-    main()
+    server = GameServer()
+    server.run()
